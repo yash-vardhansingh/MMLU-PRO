@@ -14,6 +14,16 @@ import requests
 from ai21 import AI21Client
 from ai21.models.chat import ChatMessage, ResponseFormat, DocumentSchema, FunctionToolDefinition
 from ai21.models.chat import ToolDefinition, ToolParameters
+from typing import Optional
+
+# Optional imports for local HF models; guarded at runtime
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
 
 API_KEY = ""
 random.seed(12345)
@@ -64,6 +74,46 @@ def get_client():
         client = AI21Client(api_key=API_KEY)
     elif args.model_name in ["iask"]:
         client = {"Authorization": f"Bearer {API_KEY}"}
+    elif args.model_name in ["vllm-local"]:
+        client = {"base_url": "http://0.0.0.0:8000/v1"}
+    elif args.model_name in ["hf-local"]:
+        if AutoModelForCausalLM is None or AutoTokenizer is None:
+            raise RuntimeError("transformers is not installed but required for hf-local")
+        quant_method = args.hf_quantization
+        load_in_4bit = quant_method == "4bit"
+        load_in_8bit = quant_method == "8bit"
+        bnb_config = None
+        model_kwargs = {}
+        if load_in_4bit or load_in_8bit:
+            try:
+                from transformers import BitsAndBytesConfig
+            except Exception:
+                raise RuntimeError("bitsandbytes not installed but required for 4bit/8bit quantization")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                bnb_4bit_compute_dtype=torch.float16 if args.torch_dtype == "float16" else torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model_kwargs["quantization_config"] = bnb_config
+        # Note: AWQ/GPTQ models should be loaded from pre-quantized repos via hf_model_id
+        if args.torch_dtype == "float16":
+            model_kwargs["torch_dtype"] = torch.float16
+        elif args.torch_dtype == "bfloat16":
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        elif args.torch_dtype == "auto":
+            model_kwargs["torch_dtype"] = None
+        tokenizer = AutoTokenizer.from_pretrained(args.hf_model_id, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model_id,
+            device_map=args.device_map,
+            trust_remote_code=True,
+            **model_kwargs,
+        )
+        client = {"tokenizer": tokenizer, "model": model}
     else:
         client = None
         print("For other model API calls, please implement the client definition method yourself.")
@@ -137,6 +187,35 @@ def call_api(client, instruction, inputs):
         else:
             result = response.json()["response"]["message"]
         return result
+    elif args.model_name in ["vllm-local"]:
+        payload = {
+            "model": "openai/gpt-oss-120b",   # 👈 match what you started vLLM with
+            "messages": [{"role": "user", "content": instruction + inputs}],
+            "max_tokens": 2048,
+            "temperature": 0.0,
+        }
+        response = requests.post(f"{client['base_url']}/chat/completions", json=payload)
+        if response.status_code != 200:
+            print("API call failed:", response.status_code, response.text)
+            result = None
+        else:
+            result = response.json()["choices"][0]["message"]["content"]
+    elif args.model_name in ["hf-local"]:
+        tokenizer = client["tokenizer"]
+        model = client["model"]
+        prompt = instruction + inputs
+        inputs_enc = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs_enc,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        generated = output_ids[0][inputs_enc["input_ids"].shape[1]:]
+        result = tokenizer.decode(generated, skip_special_tokens=True)
     else:
         print("For other model API calls, please implement the request method yourself.")
         result = None
@@ -361,8 +440,16 @@ if __name__ == "__main__":
                                  "gemini-1.5-flash-8b",
                                  "claude-3-sonnet-20240229",
                                  "gemini-002-pro",
-                                 "gemini-002-flash"])
+                                 "gemini-002-flash",
+                                 "vllm-local",
+                                 "hf-local"])
     parser.add_argument("--assigned_subjects", "-a", type=str, default="all")
+    # HuggingFace local model specific flags
+    parser.add_argument("--hf_model_id", type=str, default="", help="HF model id or local path for hf-local")
+    parser.add_argument("--hf_quantization", type=str, default="none", choices=["none", "8bit", "4bit"], help="Quantization mode for bitsandbytes")
+    parser.add_argument("--torch_dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"], help="Torch dtype for model weights")
+    parser.add_argument("--device_map", type=str, default="auto", help="transformers device_map for loading the model")
+    parser.add_argument("--max_new_tokens", type=int, default=512, help="Max new tokens for generation in hf-local")
     assigned_subjects = []
     args = parser.parse_args()
 
