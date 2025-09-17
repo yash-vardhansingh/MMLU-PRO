@@ -57,7 +57,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt   # includes requests, tqdm, datasets, etc.
 
 # 3️⃣ Run the script
-python vllm_ollama_eval.py \
+python evaluate_master.py \
     --output_dir eval_results \
     --vllm_base_url http://127.0.0.1:8000/v1 \   # <-- your vLLM server
     --model_alias llama3:8b \                  # name known to the server
